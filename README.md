@@ -41,13 +41,30 @@ python3
 ##### 1. Download the dataset
 [VIST homepage](http://visionandlanguage.net/VIST/dataset.html)
 
+##### 1. Organise the GLACNet Dataset directory
+
+GLACNet
+- data
+  - sis
+  - dii
+  - images
+    - train
+    - test
+    - val
+  - train(resized image)
+  - test(resized image)
+  - val(resized image)
+      
+Vocab
+- vocab.pkl
+
 ##### 2. Resize images and build vocabulary
 All the images should be resized to 256x256.
 ```
-python3 resize.py --image_dir [train_image_dir] --output_dir [output_train_dir]
-python3 resize.py --image_dir [val_image_dir] --output_dir [output_val_dir]
-python3 resize.py --image_dir [test_image_dir] --output_dir [output_test_dir]
-python3 build_vocab.py
+python3 resize.py --image_dir data/images/train --output_dir data/train
+python3 resize.py --image_dir data/images/val --output_dir data/test
+python3 resize.py --image_dir data/images/test --output_dir data/val
+python3 build_vocab.py --sis_path data/sis/train.story-in-sequence.json --vocab_path Vocab/vocab.pkl
 ```
 
 <br>
@@ -55,7 +72,7 @@ python3 build_vocab.py
 ### Training & Validation
 
 ```
-python3 train.py
+python3 train.py --vocab_path Vocab/vocab.pkl --train_image_dir data/train --val_image_dir data/val --train_sis_path data/sis/train.story-in-sequence.json --val_sis_path data/sis/val.story-in-sequence.json
 ```
 
 <br>
