@@ -119,13 +119,24 @@ class DecoderRNN(nn.Module):
         super(DecoderRNN, self).__init__()
         self.vocab = vocab
         vocab_size = len(vocab)
-        self.embed = nn.Embedding(vocab_size, embed_size)
-        self.dropout1 = nn.Dropout(p=0.1)       
+		if self.use_bert:
+            self.embed_size = 768
+        else:
+            self.embed_size = embed_size
+        self.dropout1 = nn.Dropout(p=0.1) 
+		if not use_bert:
+            self.embedding = nn.Embedding(vocab_size, self.embed_size)
+            self.embedding.weight.data.uniform_(-0.1, 0.1)
+
+            # always fine-tune embeddings (even with GloVe)
+            for p in self.embedding.parameters():
+                p.requires_grad = True      
         # self.lstm = nn.LSTM(embed_size + hidden_size, hidden_size, n_layers, batch_first=True, dropout=0.5)
         self.lstm1 = MogLSTM(embed_size + hidden_size, hidden_size, mog_layers)
         self.lstm2 = MogLSTM(hidden_size, hidden_size, mog_layers)
         self.dropout2 = nn.Dropout(p=0.5)
         self.linear = nn.Linear(hidden_size, vocab_size)
+		self.embed = nn.Embedding(vocab_size, self.embed_size)
         self.n_layers = n_layers
         self.hidden_size = hidden_size
         self.softmax = nn.Softmax(0)
