@@ -45,7 +45,7 @@ def main(args):
     val_data_loader = get_loader(args.val_image_dir, args.val_sis_path, vocab, val_transform, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     encoder = EncoderStory(args.img_feature_size, args.hidden_size, args.num_layers)
-    decoder = DecoderStory(args.embed_size, args.hidden_size, vocab)
+    decoder = DecoderStory(args.embed_size, args.hidden_size, args.mog_layer,vocab)
 
     pretrained_epoch = 0
     if args.pretrained_epoch > 0:
@@ -180,6 +180,8 @@ if __name__ == '__main__':
                         help='dimension of lstm hidden states')
     parser.add_argument('--num_layers', type=int , default=2 ,
                         help='number of layers in lstm')
+    parser.add_argument('--mog_layer', type=int , default=5 ,
+                        help='number of mog layers in lstm')
 
     parser.add_argument('--pretrained_epoch', type=int, default=0)
     parser.add_argument('--num_epochs', type=int, default=100)

@@ -6,10 +6,20 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import itertools
 import operator
-from mog_lstm import MogrifierLSTMCell
+from mog_lstm import MogLSTM
 from multiprocessing.dummy import Pool as ThreadPool
 from multiprocessing import Pool
 from collections import Counter
+
+from build_vocab import Vocabulary
+
+
+# Load pre-trained model tokenizer (vocabulary)
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased',strip_accents=True)
+
+# Load pre-trained model (weights)
+model = BertModel.from_pretrained('bert-base-uncased')
+model.eval()
 
 class EncoderCNN(nn.Module):
     def __init__(self, target_size):
@@ -42,12 +52,13 @@ class EncoderCNN(nn.Module):
 
 
 class EncoderStory(nn.Module):
-    def __init__(self, img_feature_size, hidden_size, mogrify_steps = 5):
+    def __init__(self, img_feature_size, hidden_size, n_layers):
         super(EncoderStory, self).__init__()
 
         self.hidden_size = hidden_size
+        self.n_layers = n_layers
         self.cnn = EncoderCNN(img_feature_size)
-        self.mogrifier_lstm_layer1 = MogrifierLSTMCell(img_feature_size,2 * hidden_size, mogrify_steps)
+        self.lstm = nn.LSTM(img_feature_size, hidden_size, n_layers, batch_first=True, bidirectional=True, dropout=0.5)
         self.linear = nn.Linear(hidden_size * 2 + img_feature_size, hidden_size * 2)
         self.dropout = nn.Dropout(p=0.5)
         self.bn = nn.BatchNorm1d(hidden_size * 2, momentum=0.01)
@@ -59,36 +70,27 @@ class EncoderStory(nn.Module):
     def init_weights(self):
         self.linear.weight.data.normal_(0.0, 0.02)
         self.linear.bias.data.fill_(0)
-    
-    def init_hidden(self,batch_size):
-         h1,c1 = [torch.zeros(batch_size,2 * self.hidden_size), torch.zeros(batch_size,2 * self.hidden_size)]
-         if torch.cuda.is_available():
-            h1 = h1.cuda()
-            c1 = c1.cuda()
-         return h1,c1
-    
+
     def forward(self, story_images):
         data_size = story_images.size()
         local_cnn = self.cnn(story_images.view(-1, data_size[2], data_size[3], data_size[4]))
-        batch_size = local_cnn.size()[0]
-        local_cnn = self.dropout(local_cnn)
-        h1,c1 = self.init_hidden(batch_size)
-        h1, c1 = self.mogrifier_lstm_layer1(local_cnn,(h1,c1))
-        glocal = torch.cat((local_cnn.view(data_size[0], data_size[1], -1), h1.view(data_size[0], data_size[1],-1)), 2)
+        global_rnn, (hn, cn) = self.lstm(local_cnn.view(data_size[0], data_size[1], -1))
+        glocal = torch.cat((local_cnn.view(data_size[0], data_size[1], -1), global_rnn), 2)
         output = self.linear(glocal)
         output = self.dropout(output)
         output = self.bn(output.contiguous().view(-1, self.hidden_size * 2)).view(data_size[0], data_size[1], -1)
-        return output, (h1, c1)
-    
+
+        return output, (hn, cn)
+
 
 class DecoderStory(nn.Module):
-    def __init__(self, embed_size, hidden_size, vocab):
+    def __init__(self, embed_size, hidden_size,mog_layers, vocab):
         super(DecoderStory, self).__init__()
 
         self.embed_size = embed_size
         self.linear = nn.Linear(hidden_size * 2, hidden_size)
         self.dropout = nn.Dropout(p=0.5)
-        self.rnn = DecoderRNN(embed_size, hidden_size, 2, vocab)
+        self.rnn = DecoderRNN(embed_size, hidden_size, mog_layers, vocab)
         self.init_weights()
 
     def get_params(self):
@@ -113,13 +115,15 @@ class DecoderStory(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, embed_size, hidden_size, n_layers, vocab,mogrify_steps =5):
+    def __init__(self, embed_size, hidden_size, mog_layers, vocab,use_bert = True):
         super(DecoderRNN, self).__init__()
         self.vocab = vocab
         vocab_size = len(vocab)
         self.embed = nn.Embedding(vocab_size, embed_size)
-        self.dropout1 = nn.Dropout(p=0.1)
-        self.mogrifier_lstm_layer1 = MogrifierLSTMCell(embed_size + hidden_size, hidden_size,mogrify_steps)
+        self.dropout1 = nn.Dropout(p=0.1)       
+        # self.lstm = nn.LSTM(embed_size + hidden_size, hidden_size, n_layers, batch_first=True, dropout=0.5)
+        self.lstm1 = MogLSTM(embed_size + hidden_size, hidden_size, mog_layers)
+        self.lstm2 = MogLSTM(hidden_size, hidden_size, mog_layers)
         self.dropout2 = nn.Dropout(p=0.5)
         self.linear = nn.Linear(hidden_size, vocab_size)
         self.n_layers = n_layers
@@ -143,32 +147,109 @@ class DecoderRNN(nn.Module):
     def get_params(self):
         return list(self.parameters())
 
-    def init_weights(self):
-        self.linear.weight.data.normal_(0.0, 0.02)
-        self.linear.bias.data.fill_(0)
-        
     def init_hidden(self):
-        h0, c0 = [torch.zeros(1,self.hidden_size), torch.zeros(1,self.hidden_size)]
+        h0 = torch.zeros( 1, self.hidden_size)
+        c0 = torch.zeros(1, self.hidden_size)
+        
         if torch.cuda.is_available():
             h0 = h0.cuda()
             c0 = c0.cuda()
 
         return (h0, c0)
 
+    def init_weights(self):
+        self.linear.weight.data.normal_(0.0, 0.02)
+        self.linear.bias.data.fill_(0) 
+
     def forward(self, features, captions, lengths):
-        embeddings = self.embed(captions)
+        outputs = []
+        dec_len = [x-1 for x in lengths]
+        max_dec_len = max(dec_len)
+        caption_string = []
+        for cap in captions:
+            stringList = []
+            for i in cap:
+                word = self.vocab.idx2word[i.item()]
+                if word == '<pad>' or word == '<start>' or word == '<end>' or word == '.':
+                    continue
+                else:
+                    stringList.append(word)
+            caption_string.append(stringList)
+        if not self.use_bert:
+            embeddings = self.embedding(captions)  #embedding
+        elif self.use_bert:
+            embeddings = []
+            for cap_idx in  caption_string:
+                
+                #padd caption to correct size
+                while len(cap_idx) < max_dec_len:
+                    cap_idx.append('<pad>')
+                    
+                cap = ' '.join([words for words in cap_idx])
+                encoded = cap.encode("ascii",errors = "replace")
+                cap = encoded.decode("ascii")
+                cap = u'[CLS] '+cap
+                print(cap)
+                
+                tokenized_cap = tokenizer.tokenize(cap)                
+                indexed_tokens = tokenizer.convert_tokens_to_ids(tokenized_cap)
+                tokens_tensor = torch.tensor([indexed_tokens])
+                
+
+                with torch.no_grad():
+                    encoded_layers, _ = model(tokens_tensor)
+                    
+                bert_embedding = encoded_layers.squeeze(0)
+                
+                split_cap = cap.split()
+                tokens_embedding = []
+                j = 0
+
+                for full_token in split_cap:
+                    curr_token = ''
+                    x = 0
+                    for i,_ in enumerate(tokenized_cap[1:]): # disregard CLS
+                        token = tokenized_cap[i+j]
+                        piece_embedding = bert_embedding[i+j]
+                        
+                        # full token
+                        if token == full_token and curr_token == '' :
+                            tokens_embedding.append(piece_embedding)
+                            j += 1
+                            break
+                        else: # partial token
+                            x += 1
+                            
+                            if curr_token == '':
+                                tokens_embedding.append(piece_embedding)
+                                curr_token += token.replace('#', '')
+                            else:
+                                tokens_embedding[-1] = torch.add(tokens_embedding[-1], piece_embedding)
+                                curr_token += token.replace('#', '')
+                                
+                                if curr_token == full_token: # end of partial
+                                    j += x
+                                    break                            
+                   
+                cap_embedding = torch.stack(tokens_embedding)
+
+                embeddings.append(cap_embedding)
+                
+            embeddings = torch.stack(embeddings)
+        if torch.cuda.is_available():
+            embeddings = embeddings.cuda()
         embeddings = self.dropout1(embeddings)
         features = features.unsqueeze(1).expand(-1, np.amax(lengths), -1)
         embeddings = torch.cat((features, embeddings), 2)
+       
         outputs = []
-        (hn, cn) = self.init_hidden()
+        (h1, c1) = self.init_hidden()
+        (h2,c2) = self.init_hidden()
 
         for i, length in enumerate(lengths):
             lstm_input = embeddings[i][0:length - 1]
-            lstm_input = self.dropout2(lstm_input)
-            (hn, cn) = self.mogrifier_lstm_layer1(lstm_input, (hn, cn))
-            output = hn
-            output = output.unsqueeze(0)
+            output1, (h1, c1) = self.lstm1(lstm_input.unsqueeze(0), (h1, c1))
+            output, (h2, c2) = self.lstm2(output1, (h2, c2))
             output = self.dropout2(output)
             output = self.linear(output[0])
             output = torch.cat((self.start_vec, output), 0)
@@ -179,7 +260,8 @@ class DecoderRNN(nn.Module):
 
     def inference(self, features):
         results = []
-        (hn, cn) = self.init_hidden()
+        (h1, c1) = self.init_hidden()
+        (h2, c2) = self.init_hidden()
         vocab = self.vocab
         end_vocab = vocab('<end>')
         forbidden_list = [vocab('<pad>'), vocab('<start>'), vocab('<unk>')]
@@ -198,7 +280,8 @@ class DecoderRNN(nn.Module):
             prob_sum = 1.0
 
             for i in range(50):
-                outputs, (hn, cn) = self.lstm(lstm_input, (hn, cn))
+                outputs1, (h1, c1) = self.lstm1(lstm_input, (h1, c1))
+            	outputs, (h2, c2) = self.lstm2(outputs1, (h2, c2))
                 outputs = self.linear(outputs.squeeze(1))
 
                 if predicted not in termination_list:

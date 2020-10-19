@@ -1,30 +1,74 @@
 import torch
 import torch.nn as nn
-import math
+from torch.nn import Parameter
 
-class MogrifierLSTMCell(nn.Module):
+class MogLSTM(nn.Module):
+    def __init__(self, input_sz: int, hidden_sz: int, mog_iterations: int):
+        super().__init__()
+        self.input_size = input_sz
+        self.hidden_size = hidden_sz
+        self.mog_iterations = mog_iterations
+        #Define/initialize all tensors   
+        self.Wih = Parameter(torch.Tensor(input_sz, hidden_sz * 4))
+        self.Whh = Parameter(torch.Tensor(hidden_sz, hidden_sz * 4))
+        self.bih = Parameter(torch.Tensor(hidden_sz * 4))
+        self.bhh = Parameter(torch.Tensor(hidden_sz * 4))
+        #Mogrifiers
+        self.Q = Parameter(torch.Tensor(hidden_sz,input_sz))
+        self.R = Parameter(torch.Tensor(input_sz,hidden_sz))
 
-    def __init__(self, input_size, hidden_size, mogrify_steps):
-        super(MogrifierLSTMCell, self).__init__()
-        self.mogrify_steps = mogrify_steps
-        self.lstm = nn.LSTMCell(input_size, hidden_size)
-        self.mogrifier_list = nn.ModuleList([nn.Linear(hidden_size, input_size)])  # start with q
-        for i in range(1, mogrify_steps):
-            if i % 2 == 0:
-                self.mogrifier_list.extend([nn.Linear(hidden_size, input_size)])  # q
+        self.init_weights()
+    
+    def init_weights(self):
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
             else:
-                self.mogrifier_list.extend([nn.Linear(input_size, hidden_size)])  # r
-   
-    def mogrify(self, x, h):
-        for i in range(self.mogrify_steps):
-            if (i+1) % 2 == 0: 
-                h = (2*torch.sigmoid(self.mogrifier_list[i](x))) * h
-            else:
-                x = (2*torch.sigmoid(self.mogrifier_list[i](h))) * x
-        return x, h
+                nn.init.zeros_(p.data)
 
-    def forward(self, x, states):
-        ht, ct = states
-        x, ht = self.mogrify(x, ht)
-        ht, ct = self.lstm(x, (ht, ct))
-        return ht, ct
+    def mogrify(self,xt,ht):
+      for i in range(1,self.mog_iterations+1):
+        if (i % 2 == 0):
+          ht = (2*torch.sigmoid(xt @ self.R)) * ht
+        else:
+          xt = (2*torch.sigmoid(ht @ self.Q)) * xt
+      return xt, ht
+
+    
+    #Define forward pass through all LSTM cells across all timesteps.
+    #By using PyTorch functions, we get backpropagation for free.
+    def forward(self, x: torch.Tensor, 
+                init_states: Optional[Tuple[torch.Tensor, torch.Tensor]]=None
+               ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Assumes x is of shape (batch, sequence, feature)"""
+        batch_sz, seq_sz, _ = x.size()
+        hidden_seq = []
+        #ht and Ct start as the previous states and end as the output states in each loop below
+        if init_states is None:
+            ht = torch.zeros((batch_sz,self.hidden_size)).to(x.device)
+            Ct = torch.zeros((batch_sz,self.hidden_size)).to(x.device)
+        else:
+            ht, Ct = init_states
+        for t in range(seq_sz): # iterate over the time steps
+            xt = x[:, t, :]
+            xt, ht = self.mogrify(xt,ht) #mogrification
+            gates = (xt @ self.Wih + self.bih) + (ht @ self.Whh + self.bhh)
+            ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
+
+            ### The LSTM Cell!
+            ft = torch.sigmoid(forgetgate)
+            it = torch.sigmoid(ingate)
+            Ct_candidate = torch.tanh(cellgate)
+            ot = torch.sigmoid(outgate)
+            #outputs
+            Ct = (ft * Ct) + (it * Ct_candidate)
+            ht = ot * torch.tanh(Ct)
+            ###
+
+            hidden_seq.append(ht.unsqueeze(Dim.batch))
+        hidden_seq = torch.cat(hidden_seq, dim=Dim.batch)
+        # reshape from shape (sequence, batch, feature) to (batch, sequence, feature)
+        hidden_seq = hidden_seq.transpose(Dim.batch, Dim.seq).contiguous()
+        return hidden_seq, (ht, Ct)
+
+
